@@ -1,0 +1,105 @@
+#!/bin/bash
+#
+# Script Letsencrypt SSL
+# Desc: this script create e SSL letsencrypt cert and deploy it into zimbra
+# To automatise deploy and renew do:
+# ln -s /usr/local/sbin/letsencrypt-zimbra /etc/cron.daily/letsencrypt-zimbra 
+#
+# The hostname is need correctly setted:
+# hostnamectl set-hostname mail.example.com
+# check if /etc/hosts contains: 
+# 	127.0.0.1 localhost
+# 	127.0.1.1 mail.example.com
+# /opt/zimbra/libexec/zmsetservername -n mail.example.com
+#
+
+# Force renewal at all execution of this script
+forcerenew=false
+
+# Set your Cloudflare api token (empty for http validation transaction)
+dns_cloudflare_api_token=
+
+zmhostname=$(/opt/zimbra/bin/zmhostname)
+hostname=$(/usr/bin/hostname -f)
+
+## Check hostname
+if [ "${zmhostname}" == "${hostname}" ] ; then
+
+	## Generate clodflare conf for certbot if setted
+  if [ ! -f /etc/cloudflare.ini ] ; then
+	  if [ "${dns_cloudflare_api_token}" == "" ] ; then
+	  		echo "dns_cloudflare_api_token = ${dns_cloudflare_api_token}" > /etc/cloudflare.ini
+	  fi
+  fi
+
+	## Check if certbot installed with pip
+	if [ ! -f /usr/local/sbin/certbot ] ; then
+		apt --purge remove cerbot
+		apt install -y net-tools dnsutils
+		apt install -y python3 python3-venv libaugeas0
+		python3 -m venv /opt/certbot/
+		/opt/certbot/bin/pip install --upgrade pip
+		/opt/certbot/bin/pip install certbot
+		ln -s /opt/certbot/bin/certbot /usr/local/sbin/certbot
+		if [ -f /etc/cloudflare.ini ] ; then
+			/opt/certbot/bin/pip install certbot-dns-cloudflare
+		fi
+	fi
+
+	## If first cert request (cert not already exist)
+	if [ ! -d /etc/letsencrypt/live/${hostname} ] ; then
+		if [ "${dns_cloudflare_api_token}" == "" ] ; then
+			/usr/local/sbin/certbot certonly -d ${hostname} --standalone -n --preferred-chain  "ISRG Root X1" --agree-tos --register-unsafely-without-email --key-type rsa
+		else
+			/usr/local/sbin/certbot certonly --dns-cloudflare --dns-cloudflare-credentials /etc/cloudflare.ini --preferred-chain  "ISRG Root X1" --key-type rsa --agree-tos --cert-name ${hostname} --register-unsafely-without-email -d ${hostname}
+		fi
+		## Disable TLS for LDAP (letsencrypt possible incompatibility) if first time
+		su zimbra -c '/opt/zimbra/bin/zmlocalconfig -e ssl_allow_untrusted_certs=true'
+		su zimbra -c '/opt/zimbra/bin/zmlocalconfig -e ldap_starttls_supported=0'
+		su zimbra -c '/opt/zimbra/bin/zmlocalconfig -e ldap_starttls_required=false'
+		su zimbra -c '/opt/zimbra/bin/zmlocalconfig -e ldap_common_require_tls=0'
+	else
+		## Cert already exist, check if renew forced or only at exipire date
+		/usr/bin/rm -f /tmp/out.lets
+		if [ "$forcerenew" == "true" ] ; then
+			echo "Forced Renew"
+			/usr/local/sbin/certbot renew --force-renewal --agree-tos --non-interactive --deploy-hook "/usr/bin/echo true > /tmp/out.lets"
+		else
+			/usr/local/sbin/certbot renew --agree-tos --non-interactive --deploy-hook "/usr/bin/echo true > /tmp/out.lets"
+		fi
+	fi
+
+	## If the cert was just renewed
+	if [ -f /tmp/out.lets ] ; then
+		## Generate Zimbra cert, key and root
+		cp "/etc/letsencrypt/live/${hostname}/privkey.pem" /opt/zimbra/ssl/zimbra/commercial/commercial.key
+		chown zimbra:zimbra /opt/zimbra/ssl/zimbra/commercial/commercial.key
+		if [ ! -f /tmp/ISRG-X1.pem ] ; then
+			wget -O /tmp/ISRG-X1.pem https://letsencrypt.org/certs/isrgrootx1.pem.txt
+		fi
+		rm -f "/etc/letsencrypt/live/${hostname}/chainZimbra.pem"
+		cp "/etc/letsencrypt/live/${hostname}/chain.pem" "/etc/letsencrypt/live/${hostname}/chainZimbra.pem"
+		cat /tmp/ISRG-X1.pem >> "/etc/letsencrypt/live/${hostname}/chainZimbra.pem"
+		chown zimbra:zimbra /etc/letsencrypt -R
+		cd /tmp
+		
+		## Deploy cert on Zimbra
+		su zimbra -c '/opt/zimbra/bin/zmcertmgr deploycrt comm "/etc/letsencrypt/live/${hostname}/cert.pem" "/etc/letsencrypt/live/${hostname}/chainZimbra.pem"'
+		rm -f "/etc/letsencrypt/live/${hostname}/chainZimbra.pem"
+	
+		## Ensure all permission is right
+		/opt/zimbra/libexec/zmfixperms
+	
+		## Restart Zimbra services
+		su zimbra -c '/opt/zimbra/bin/zmcontrol stop'
+		sleep 5
+		su zimbra -c '/opt/zimbra/bin/zmcontrol start'
+
+		## Remove temp file
+		/usr/bin/rm -f /tmp/out.lets
+	fi
+else
+	echo "Hostname non correctly configured !"
+	exit 1
+fi
+exit 0
